@@ -64,3 +64,7 @@ Open Arduino IDE, connect the M5StickS3 via USB-C, and set the following under t
 1. Open the project sketch (`.ino` file).
 2. Click the Upload button.
 3. Flash the exact same sketch to both M5StickS3 devices.
+
+4. Please note: every letter and pixel of this project is a "vibecode" cursed by all the gods—please be extremely attentive and understanding. I did the best I could; please forgive me.
+
+i'm an anomalocaris "I do my best"
