@@ -4,6 +4,15 @@ Active hide-and-seek game for two M5StickS3 devices. One player hides as the Fox
 
 The game uses radio (ESP-NOW) to track distance like a "hot-or-cold" radar and an infrared beam (IR) on top of the device for direct line-of-sight tag shots.
 
+<p align="center">
+  <img src="photo_2026-09-25_19-30-00.jpg" width="45%" />
+  <img src="photo_2026-09-25_19-30-10.jpg" width="45%" />
+</p>
+<p align="center">
+  <img src="photo_2026-09-25_19-30-14.jpg" width="45%" />
+  <img src="photo_2026-09-25_19-30-18.jpg" width="45%" />
+</p>
+
 ---
 
 ## Hardware
