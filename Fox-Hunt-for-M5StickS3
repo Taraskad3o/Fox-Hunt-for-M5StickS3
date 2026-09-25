@@ -1,0 +1,807 @@
+#include <M5Unified.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+#include "esp_system.h"
+
+// --- NATIVE ESP-IDF RMT DRIVERS ---
+#include "driver/rmt_tx.h"
+#include "driver/rmt_rx.h"
+#include "driver/rmt_encoder.h"
+
+// --- HARDWARE PIN DEFINITIONS (M5StickS3) ---
+#define IR_TX_PIN       46 
+#define IR_RX_PIN       42 
+#define BTN_BLUE_PIN    11 
+#define BTN_SIDE_PIN    12 
+
+// --- GAME CONFIGURATION ---
+const int RSSI_DANGER_THRESHOLD = -68;
+const int DODGE_DURATION_MS = 30000;
+const int IR_LISTEN_WINDOW_MS = 500;
+const int MAX_TX_POWER = 52; 
+const int LINK_CHECK_INTERVAL_MS = 500;
+const int LINK_TIMEOUT_MS = 25000;
+
+// NEC Protocol Constants
+const uint16_t NEC_SHOT_ADDR = 0x1234;
+const uint8_t  NEC_SHOT_CMD  = 0x77;
+
+#define NEC_HEADER_MARK     9000
+#define NEC_HEADER_SPACE    4500
+#define NEC_BIT_MARK        560
+#define NEC_BIT_0_SPACE     560
+#define NEC_BIT_1_SPACE     1690
+
+// --- ESP-NOW PACKET ---
+typedef struct __attribute__((packed)) {
+    uint32_t gameId;
+    uint8_t role;      // 1 - Fox, 2 - Hunter
+    uint8_t event;     // 0 - Ping, 1 - Shot, 2 - Hit, 3 - Dodge, 4 - Out of Ammo
+    int8_t rssi;
+} GamePacket;
+
+uint8_t broadcastMac[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+
+enum GameRole { ROLE_SELECT, ROLE_FOX, ROLE_HUNTER, ROLE_VICTORY, ROLE_GAME_OVER };
+GameRole currentRole = ROLE_SELECT;
+
+M5Canvas canvas(&M5.Display);
+
+// --- RMT HANDLES & BUFFERS ---
+rmt_channel_handle_t tx_chan = NULL;
+rmt_encoder_handle_t copy_encoder = NULL;
+
+rmt_channel_handle_t rx_chan = NULL;
+static rmt_symbol_word_t rx_raw_symbols[128];
+static volatile bool rx_done = false;
+
+// --- STATE VARIABLES ---
+uint32_t currentGameId = 0;
+unsigned long lastPeerSeen = 0;
+bool isLinkAlive = false;
+bool peerConnectedOnce = false;
+int lastRssi = -100;
+
+int ammo = 5;
+bool isHunterWaiting = false;
+unsigned long hunterWaitEndTime = 0;
+unsigned long zeroAmmoTime = 0;
+
+unsigned long nextTauntTime = 0;
+bool isBarkingAnim = false;
+unsigned long barkAnimEndTime = 0;
+bool isDodging = false;
+unsigned long dodgeEndTime = 0;
+
+// Window to listen for IR after shot packet
+bool isListeningForIR = false;
+unsigned long listenIREndTime = 0;
+
+volatile bool flagFoxHit = false;
+volatile bool flagDodgeTriggered = false;
+volatile bool flagHunterWait = false;
+volatile bool flagVictory = false;
+
+bool lastBlueState = HIGH;
+bool lastSideState = HIGH;
+
+// --- RMT NEC IMPLEMENTATION ---
+uint32_t buildNECRaw(uint16_t address, uint8_t command) {
+    uint16_t nec_addr;
+    if (address <= 0x00FF) {
+        uint8_t addr8 = address & 0xFF;
+        nec_addr = ((uint16_t)(~addr8) << 8) | addr8;
+    } else {
+        nec_addr = address;
+    }
+    uint32_t raw = 0;
+    raw |= (uint32_t)nec_addr;
+    raw |= (uint32_t)command << 16;
+    raw |= (uint32_t)(~command) << 24;
+    return raw;
+}
+
+void encodeNEC(uint32_t raw_data, rmt_symbol_word_t *symbols, size_t *symbol_count) {
+    size_t idx = 0;
+    symbols[idx].duration0 = NEC_HEADER_MARK;
+    symbols[idx].level0 = 1;
+    symbols[idx].duration1 = NEC_HEADER_SPACE;
+    symbols[idx].level1 = 0;
+    idx++;
+
+    for (int i = 0; i < 32; i++) {
+        symbols[idx].duration0 = NEC_BIT_MARK;
+        symbols[idx].level0 = 1;
+        if (raw_data & (1UL << i)) {
+            symbols[idx].duration1 = NEC_BIT_1_SPACE;
+        } else {
+            symbols[idx].duration1 = NEC_BIT_0_SPACE;
+        }
+        symbols[idx].level1 = 0;
+        idx++;
+    }
+
+    symbols[idx].duration0 = NEC_BIT_MARK;
+    symbols[idx].level0 = 1;
+    symbols[idx].duration1 = 0;
+    symbols[idx].level1 = 0;
+    idx++;
+
+    *symbol_count = idx;
+}
+
+void setup_rmt_tx() {
+    if (tx_chan != NULL) return;
+    rmt_tx_channel_config_t tx_chan_config = {
+        .gpio_num = (gpio_num_t)IR_TX_PIN,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 1000000,
+        .mem_block_symbols = 64,
+        .trans_queue_depth = 4,
+        .flags = {
+            .invert_out = false,
+            .with_dma = false,
+        }
+    };
+    ESP_ERROR_CHECK(rmt_new_tx_channel(&tx_chan_config, &tx_chan));
+
+    rmt_carrier_config_t carrier_cfg = {
+        .frequency_hz = 38000,
+        .duty_cycle = 0.50,
+        .flags = {
+            .polarity_active_low = false,
+        }
+    };
+    ESP_ERROR_CHECK(rmt_apply_carrier(tx_chan, &carrier_cfg));
+
+    rmt_copy_encoder_config_t encoder_config = {};
+    ESP_ERROR_CHECK(rmt_new_copy_encoder(&encoder_config, &copy_encoder));
+    ESP_ERROR_CHECK(rmt_enable(tx_chan));
+}
+
+void fireInfraredShot() {
+    if (tx_chan == NULL) setup_rmt_tx();
+    uint32_t raw = buildNECRaw(NEC_SHOT_ADDR, NEC_SHOT_CMD);
+    rmt_symbol_word_t symbols[68];
+    size_t symbol_count = 0;
+    encodeNEC(raw, symbols, &symbol_count);
+
+    rmt_transmit_config_t tx_config = {
+        .loop_count = 0,
+        .flags = { .eot_level = 0 }
+    };
+    
+    rmt_transmit(tx_chan, copy_encoder, symbols, symbol_count * sizeof(rmt_symbol_word_t), &tx_config);
+    rmt_tx_wait_all_done(tx_chan, 150);
+}
+
+static bool rmt_rx_done_callback(rmt_channel_handle_t channel, const rmt_rx_done_event_data_t *edata, void *user_data) {
+    rx_done = true;
+    return true;
+}
+
+void setup_rmt_rx() {
+    if (rx_chan != NULL) return;
+    rmt_rx_channel_config_t rx_chan_config = {
+        .gpio_num = (gpio_num_t)IR_RX_PIN,
+        .clk_src = RMT_CLK_SRC_DEFAULT,
+        .resolution_hz = 1000000,
+        .mem_block_symbols = 128,
+    };
+    ESP_ERROR_CHECK(rmt_new_rx_channel(&rx_chan_config, &rx_chan));
+
+    rmt_rx_event_callbacks_t cbs = {
+        .on_recv_done = rmt_rx_done_callback,
+    };
+    ESP_ERROR_CHECK(rmt_rx_register_event_callbacks(rx_chan, &cbs, NULL));
+    ESP_ERROR_CHECK(rmt_enable(rx_chan));
+}
+
+void start_rmt_receive() {
+    if (rx_chan == NULL) return;
+    rmt_receive_config_t receive_config = {
+        .signal_range_min_ns = 1250,
+        .signal_range_max_ns = 12000000
+    };
+    rmt_receive(rx_chan, rx_raw_symbols, sizeof(rx_raw_symbols), &receive_config);
+}
+
+bool decodeNEC(rmt_symbol_word_t *symbols, uint32_t *out_raw) {
+    *out_raw = 0;
+    uint32_t header_low  = symbols[0].duration0;
+    uint32_t header_high = symbols[0].duration1;
+
+    if (header_low < 6500 || header_low > 11500 || header_high < 2500 || header_high > 6000) {
+        return false;
+    }
+
+    for (int i = 0; i < 32; i++) {
+        uint32_t mark  = symbols[i + 1].duration0;
+        uint32_t space = symbols[i + 1].duration1;
+
+        if (mark < 200 || mark > 1100) return false;
+        
+        if (space > 950) {
+            *out_raw |= (1UL << i);
+        }
+    }
+
+    uint8_t cmd     = (*out_raw >> 16) & 0xFF;
+    uint8_t cmd_inv = (*out_raw >> 24) & 0xFF;
+    return ((cmd ^ cmd_inv) == 0xFF);
+}
+
+// --- COMMS ---
+void sendGamePacket(uint8_t eventType) {
+    if (currentGameId == 0) return;
+    GamePacket pkt;
+    pkt.gameId = currentGameId;
+    pkt.role = (currentRole == ROLE_FOX) ? 1 : 2;
+    pkt.event = eventType;
+    pkt.rssi = (int8_t)lastRssi;
+    esp_now_send(broadcastMac, (uint8_t *)&pkt, sizeof(pkt));
+}
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+    if (len != sizeof(GamePacket)) return;
+    GamePacket *pkt = (GamePacket *)incomingData;
+
+    if (info->rx_ctrl != nullptr) {
+        lastRssi = info->rx_ctrl->rssi;
+    }
+
+    if (currentRole == ROLE_FOX && currentGameId == 0 && pkt->role == 2) {
+        currentGameId = pkt->gameId;
+    }
+
+    if (pkt->gameId == currentGameId) {
+        lastPeerSeen = millis();
+        isLinkAlive = true;
+        peerConnectedOnce = true;
+
+        // Shot packet received by Fox
+        if (currentRole == ROLE_FOX && pkt->event == 1 && !isDodging) {
+            if (lastRssi > RSSI_DANGER_THRESHOLD) {
+                isListeningForIR = true;
+                listenIREndTime = millis() + IR_LISTEN_WINDOW_MS;
+            }
+        }
+
+        // Hit confirmed
+        if (currentRole == ROLE_HUNTER && pkt->event == 2) {
+            flagVictory = true;
+        }
+
+        // Dodge confirmed -> Hunter wait penalty
+        if (currentRole == ROLE_HUNTER && pkt->event == 3) {
+            flagHunterWait = true;
+        }
+
+        // Hunter out of ammo
+        if (currentRole == ROLE_FOX && pkt->event == 4) {
+            flagVictory = true;
+        }
+    } else if (peerConnectedOnce && pkt->gameId != currentGameId && pkt->gameId != 0) {
+        flagVictory = true;
+    }
+}
+
+// --- AUDIO ---
+void playBark() {
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(50);
+    M5.Speaker.tone(1900, 50);
+    delay(70); 
+    M5.Speaker.tone(2500, 70);
+    M5.Speaker.stop();
+    M5.Speaker.end();
+}
+
+void playShotSound() {
+    for (int f = 3000; f > 600; f -= 300) {
+        M5.Speaker.tone(f, 5);
+        delay(6); 
+    }
+    M5.Speaker.stop();
+}
+
+void playVictoryFanfare() {
+    int notes[] = {1200, 1500, 1800, 2200};
+    for (int n : notes) {
+        M5.Speaker.tone(n, 80);
+        delay(90); 
+    }
+    M5.Speaker.stop();
+}
+
+void playDodgeSiren() {
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(50);
+    for (int i = 0; i < 2; i++) {
+        M5.Speaker.tone(800, 80);
+        delay(60);
+        M5.Speaker.tone(1300, 90);
+        delay(70);
+    }
+    M5.Speaker.stop();
+    M5.Speaker.end();
+}
+
+// --- UI RENDERING ---
+void drawBattery() {
+    int b = M5.Power.getBatteryLevel();
+    if (b < 0) b = 0; 
+    if (b > 100) b = 100;
+
+    uint16_t batColor = GREEN;
+    if (b <= 10) batColor = RED;
+    else if (b <= 25) batColor = YELLOW;
+
+    bool showText = !(b <= 10 && ((millis() / 500) % 2 == 0));
+    canvas.setTextSize(1);
+    canvas.setTextColor(batColor);
+
+    int bx = 110, by = 5, bw = 18, bh = 10;
+    if (showText) {
+        char buf[8];
+        if (b <= 10) sprintf(buf, "LOW");
+        else sprintf(buf, "%d%%", b);
+        canvas.drawRightString(buf, bx - 4, by + 1);
+    }
+
+    canvas.drawRect(bx, by, bw, bh, batColor);
+    canvas.fillRect(bx + bw, by + 2, 2, bh - 4, batColor);
+
+    int bars = (b > 75) ? 3 : ((b > 40) ? 2 : ((b > 10) ? 1 : 0));
+    for (int i = 0; i < bars; i++) {
+        canvas.fillRect(bx + 2 + (i * 5), by + 2, 4, bh - 4, batColor);
+    }
+}
+
+void drawFoxFace(bool mouthOpen) {
+    canvas.fillScreen(canvas.color565(255, 140, 0));
+    canvas.fillEllipse(67, 160, 55, 45, WHITE);
+
+    canvas.fillTriangle(15, 75, 45, 15, 60, 75, canvas.color565(210, 80, 0));
+    canvas.fillTriangle(120, 75, 90, 15, 75, 75, canvas.color565(210, 80, 0));
+    canvas.fillTriangle(25, 70, 45, 28, 55, 70, canvas.color565(255, 180, 190));
+    canvas.fillTriangle(110, 70, 90, 28, 80, 70, canvas.color565(255, 180, 190));
+
+    canvas.fillCircle(40, 110, 8, BLACK);
+    canvas.fillCircle(95, 110, 8, BLACK);
+    canvas.fillCircle(38, 107, 3, WHITE);
+    canvas.fillCircle(93, 107, 3, WHITE);
+
+    canvas.fillCircle(25, 130, 9, canvas.color565(255, 150, 160));
+    canvas.fillCircle(110, 130, 9, canvas.color565(255, 150, 160));
+    canvas.fillTriangle(60, 140, 75, 140, 67, 148, BLACK);
+
+    if (mouthOpen) {
+        canvas.fillCircle(67, 162, 10, canvas.color565(180, 0, 0));
+        canvas.setTextColor(WHITE);
+        canvas.setTextSize(2);
+        canvas.drawCenterString("BARK!", 67, 185);
+    } else {
+        canvas.drawFastHLine(60, 155, 15, BLACK);
+    }
+
+    canvas.setTextSize(1);
+    if (isLinkAlive) {
+        canvas.setTextColor(lastRssi > RSSI_DANGER_THRESHOLD ? RED : GREEN);
+        canvas.drawString(lastRssi > RSSI_DANGER_THRESHOLD ? "DANGER!" : "SAFE", 5, 5);
+    } else {
+        canvas.setTextColor(canvas.color565(100, 100, 100));
+        canvas.drawString("SEARCH...", 5, 5);
+    }
+
+    drawBattery();
+    canvas.setTextColor(WHITE);
+    canvas.setTextSize(2);
+    canvas.drawCenterString("FOX", 67, 215); 
+}
+
+void drawFoxDodgeUI(int secLeft) {
+    canvas.fillScreen(canvas.color565(180, 0, 0));
+    canvas.setTextColor(YELLOW);
+    canvas.setTextSize(2);
+    canvas.drawCenterString("MISSED!", 67, 18);
+
+    canvas.setTextColor(WHITE);
+    canvas.setTextSize(2);
+    canvas.drawCenterString("RUN AWAY!", 67, 55);
+    canvas.drawCenterString("TIME LEFT:", 67, 80);
+
+    canvas.setTextColor(YELLOW);
+    canvas.setTextSize(6);
+    char buf[8];
+    sprintf(buf, "%02d", secLeft);
+    canvas.drawCenterString(buf, 67, 120);
+
+    drawBattery();
+    canvas.setTextSize(2);
+    canvas.setTextColor(WHITE);
+    canvas.drawCenterString("SHIELD ON", 67, 200);
+}
+
+void drawHunterWaitUI(int secLeft) {
+    canvas.fillScreen(canvas.color565(180, 0, 0));
+    canvas.setTextColor(YELLOW);
+    canvas.setTextSize(2);
+    canvas.drawCenterString("ESCAPED!", 67, 18);
+
+    canvas.setTextColor(WHITE);
+    canvas.setTextSize(2);
+    canvas.drawCenterString("FOX DODGED", 67, 55);
+    canvas.drawCenterString("WAIT:", 67, 80);
+
+    canvas.setTextColor(YELLOW);
+    canvas.setTextSize(6);
+    char buf[8];
+    sprintf(buf, "%02d", secLeft);
+    canvas.drawCenterString(buf, 67, 120);
+
+    drawBattery();
+    canvas.setTextSize(2);
+    canvas.setTextColor(WHITE);
+    canvas.drawCenterString("PENALTY", 67, 200);
+}
+
+void drawHunterUI() {
+    canvas.fillScreen(BLACK);
+
+    canvas.setTextSize(2);
+    if (isLinkAlive) {
+        if (lastRssi > RSSI_DANGER_THRESHOLD) {
+            canvas.setTextColor(RED);
+            canvas.drawCenterString("TARGET NEAR", 67, 5);
+        } else {
+            canvas.setTextColor(GREEN);
+            canvas.drawCenterString("TRACKING", 67, 5);
+        }
+    } else {
+        canvas.setTextColor(canvas.color565(100, 100, 100));
+        canvas.drawCenterString("SIGNAL LOST", 67, 5);
+    }
+
+    drawBattery();
+
+    int numBars = isLinkAlive ? constrain(map(lastRssi, -90, -45, 1, 12), 0, 12) : 0;
+    int boxX = 55, boxY = 30, boxW = 24, boxH = 130;
+    canvas.drawRoundRect(boxX, boxY, boxW, boxH, 4, canvas.color565(60, 60, 60));
+    
+    for (int i = 0; i < 12; i++) {
+        int segH = 8;
+        int segW = 18;
+        int segX = boxX + 3;
+        int segY = (boxY + boxH - 10) - (i * 10);
+
+        uint16_t bColor = canvas.color565(25, 25, 25);
+        if (isLinkAlive && i < numBars) {
+            bColor = (i < 4) ? GREEN : ((i < 8) ? YELLOW : RED);
+        }
+        canvas.fillRect(segX, segY, segW, segH, bColor);
+    }
+
+    canvas.setTextColor(WHITE);
+    canvas.setTextSize(2);
+    canvas.drawString("AMMO:", 15, 175);
+
+    for (int i = 0; i < 5; i++) {
+        int x = 12 + i * 23;
+        int y = 200;
+        if (i < ammo) {
+            canvas.fillRoundRect(x, y, 16, 26, 4, CYAN);
+            canvas.fillTriangle(x, y, x + 16, y, x + 8, y - 6, YELLOW);
+        } else {
+            canvas.drawRoundRect(x, y, 16, 26, 4, canvas.color565(80, 80, 80));
+        }
+    }
+}
+
+void scheduleNextTaunt() {
+    nextTauntTime = millis() + random(40000, 75000);
+}
+
+void resetGameState() {
+    currentGameId = 0;
+    peerConnectedOnce = false;
+    isDodging = false;
+    isHunterWaiting = false;
+    isListeningForIR = false;
+    zeroAmmoTime = 0;
+    ammo = 5;
+    lastRssi = -100;
+    flagFoxHit = false;
+    flagDodgeTriggered = false;
+    flagHunterWait = false;
+    flagVictory = false;
+    nextTauntTime = 0;
+}
+
+void setup() {
+    Serial.begin(115200);
+    delay(500);
+
+    auto cfg = M5.config();
+    M5.begin(cfg);
+
+    M5.Power.setExtOutput(true);
+    M5.Display.setBrightness(180);
+
+    pinMode(BTN_BLUE_PIN, INPUT_PULLUP);
+    pinMode(BTN_SIDE_PIN, INPUT_PULLUP);
+
+    M5.Display.setRotation(0);
+    canvas.setPsram(false); 
+    canvas.createSprite(135, 240); 
+
+    WiFi.mode(WIFI_STA);
+    WiFi.disconnect();
+    esp_wifi_set_max_tx_power(MAX_TX_POWER); 
+
+    if (esp_now_init() == ESP_OK) {
+        esp_now_peer_info_t peerInfo = {};
+        memcpy(peerInfo.peer_addr, broadcastMac, 6);
+        peerInfo.channel = 1;
+        peerInfo.encrypt = false;
+        esp_now_add_peer(&peerInfo);
+        esp_now_register_recv_cb(esp_now_recv_cb_t(onDataRecv));
+    }
+
+    currentRole = ROLE_SELECT;
+}
+
+void loop() {
+    M5.update();
+    unsigned long now = millis();
+
+    // Battery protection
+    int currentBat = M5.Power.getBatteryLevel();
+    if (currentBat >= 0 && currentBat <= 8) {
+        M5.Display.startWrite();
+        M5.Display.fillScreen(RED);
+        M5.Display.setTextColor(WHITE);
+        M5.Display.setTextSize(2);
+        M5.Display.drawCenterString("BATTERY EMPTY", 67, 100);
+        M5.Display.drawCenterString("POWER OFF...", 67, 140);
+        M5.Display.endWrite();
+        M5.Power.powerOff(); 
+    }
+
+    // Process IR reception via RMT hardware
+    if (currentRole == ROLE_FOX && !isDodging) {
+        if (rx_done) {
+            rx_done = false;
+            uint32_t rx_raw = 0;
+            if (decodeNEC(rx_raw_symbols, &rx_raw)) {
+                uint16_t rx_addr = rx_raw & 0xFFFF;
+                uint8_t  rx_cmd  = (rx_raw >> 16) & 0xFF;
+                if (rx_addr == NEC_SHOT_ADDR && rx_cmd == NEC_SHOT_CMD) {
+                    isListeningForIR = false;
+                    flagFoxHit = true;
+                }
+            }
+            start_rmt_receive();
+        }
+
+        // Check if 500ms reaction window expired without IR hit
+        if (isListeningForIR && now > listenIREndTime) {
+            isListeningForIR = false;
+            flagDodgeTriggered = true;
+        }
+    }
+
+    // Button Edge Detection
+    bool curBlue = digitalRead(BTN_BLUE_PIN);
+    bool curSide = digitalRead(BTN_SIDE_PIN);
+
+    bool bluePressed = (curBlue == LOW && lastBlueState == HIGH);
+    bool sidePressed = (curSide == LOW && lastSideState == HIGH);
+    bool bothPressed = (curBlue == LOW && curSide == LOW);
+
+    lastBlueState = curBlue;
+    lastSideState = curSide;
+
+    if (currentRole != ROLE_SELECT && bothPressed) {
+        currentRole = ROLE_SELECT;
+        resetGameState();
+        M5.Speaker.begin();
+        M5.Speaker.tone(1000, 70);
+        delay(100);
+        M5.Speaker.stop();
+        M5.Speaker.end();
+    }
+
+    // Game Event Handling
+    if (flagFoxHit) {
+        flagFoxHit = false;
+        sendGamePacket(2); 
+        currentRole = ROLE_GAME_OVER;
+        M5.Speaker.begin();
+        M5.Speaker.tone(300, 400); 
+        delay(400);
+        M5.Speaker.stop();
+        M5.Speaker.end();
+    }
+    
+    if (flagDodgeTriggered) {
+        flagDodgeTriggered = false;
+        isDodging = true;
+        dodgeEndTime = now + DODGE_DURATION_MS; 
+        sendGamePacket(3); 
+        playDodgeSiren();
+    }
+
+    if (flagHunterWait) {
+        flagHunterWait = false;
+        isHunterWaiting = true;
+        hunterWaitEndTime = now + DODGE_DURATION_MS; 
+        M5.Speaker.tone(400, 300);
+        delay(300);
+        M5.Speaker.stop();
+    }
+    
+    if (flagVictory) {
+        flagVictory = false;
+        currentRole = ROLE_VICTORY;
+        playVictoryFanfare();
+    }
+
+    // Keepalive ping
+    static unsigned long lastPingSent = 0;
+    if (now - lastPingSent > LINK_CHECK_INTERVAL_MS) {
+        lastPingSent = now;
+        if (currentRole == ROLE_FOX || currentRole == ROLE_HUNTER) {
+            sendGamePacket(0);
+        }
+        isLinkAlive = (now - lastPeerSeen < 3000);
+
+        if (peerConnectedOnce && (now - lastPeerSeen > LINK_TIMEOUT_MS) && 
+            (currentRole == ROLE_FOX || currentRole == ROLE_HUNTER)) {
+            currentRole = ROLE_VICTORY;
+            M5.Speaker.tone(200, 500);
+            delay(500);
+            M5.Speaker.stop();
+        }
+    }
+
+    // Role State Machine
+    if (currentRole == ROLE_SELECT) {
+        if (sidePressed) { // Select Fox
+            currentRole = ROLE_FOX;
+            resetGameState();
+            scheduleNextTaunt();
+
+            M5.Speaker.end();
+            setup_rmt_rx();
+            start_rmt_receive();
+        }
+        if (bluePressed) { // Select Hunter
+            currentRole = ROLE_HUNTER;
+            resetGameState();
+            currentGameId = ((uint32_t)esp_random() % 900000) + 100000;
+            setup_rmt_tx();
+            M5.Speaker.begin();
+            M5.Speaker.setVolume(50);
+            M5.Speaker.tone(2000, 80);
+            delay(80);
+            M5.Speaker.stop();
+        }
+    } 
+    else if (currentRole == ROLE_FOX) {
+        if (isDodging) {
+            if (now > dodgeEndTime) {
+                isDodging = false;
+                scheduleNextTaunt();
+            }
+        } else {
+            if (sidePressed || now >= nextTauntTime) { 
+                playBark();
+                scheduleNextTaunt();
+            }
+            if (isBarkingAnim && now > barkAnimEndTime) {
+                isBarkingAnim = false;
+            }
+        }
+    } 
+    else if (currentRole == ROLE_HUNTER) {
+        if (isHunterWaiting) {
+            if (now > hunterWaitEndTime) {
+                isHunterWaiting = false;
+                M5.Speaker.tone(1500, 120);
+                delay(120);
+                M5.Speaker.stop();
+            }
+        } else {
+            if (bluePressed) { 
+                if (ammo > 0) {
+                    ammo--;
+                    playShotSound();       
+                    sendGamePacket(1);
+                    fireInfraredShot();
+                    if (ammo == 0) zeroAmmoTime = now;
+                } else {
+                    M5.Speaker.tone(250, 40);
+                    delay(40);
+                    M5.Speaker.stop();
+                }
+            }
+        }
+
+        if (currentRole == ROLE_HUNTER && ammo == 0 && zeroAmmoTime != 0 && (now - zeroAmmoTime > 2000)) {
+            sendGamePacket(4); 
+            currentRole = ROLE_GAME_OVER;
+            zeroAmmoTime = 0;
+            M5.Speaker.tone(200, 1000);
+            delay(1000);
+            M5.Speaker.stop();
+        }
+    }
+
+    // Refresh display (20 FPS)
+    static unsigned long lastFrameTime = 0;
+    if (now - lastFrameTime >= 50) { 
+        lastFrameTime = now;
+
+        if (currentRole == ROLE_SELECT) {
+            canvas.fillScreen(canvas.color565(20, 20, 45));
+            canvas.setTextColor(YELLOW);
+            canvas.setTextSize(2);
+            canvas.drawCenterString("FOX HUNT", 67, 25);
+
+            canvas.fillRoundRect(10, 65, 115, 60, 8, ORANGE);
+            canvas.setTextColor(BLACK);
+            canvas.drawCenterString("SIDE BTN", 67, 75);
+            canvas.drawCenterString("FOX", 67, 100);
+
+            canvas.fillRoundRect(10, 145, 115, 60, 8, CYAN);
+            canvas.setTextColor(BLACK);
+            canvas.drawCenterString("BLUE BTN", 67, 155);
+            canvas.drawCenterString("HUNTER", 67, 180);
+
+            drawBattery();
+        } 
+        else if (currentRole == ROLE_FOX) {
+            if (isDodging) {
+                drawFoxDodgeUI((dodgeEndTime - now) / 1000);
+            } else {
+                drawFoxFace(isBarkingAnim);
+            }
+        } 
+        else if (currentRole == ROLE_HUNTER) {
+            if (isHunterWaiting) {
+                drawHunterWaitUI((hunterWaitEndTime - now) / 1000);
+            } else {
+                drawHunterUI();
+            }
+        } 
+        else if (currentRole == ROLE_VICTORY) {
+            canvas.fillScreen(canvas.color565(0, 160, 0));
+            canvas.setTextColor(YELLOW);
+            canvas.setTextSize(2);
+            canvas.drawCenterString("VICTORY!", 67, 40);
+            canvas.setTextColor(WHITE);
+            canvas.drawCenterString(currentRole == ROLE_FOX ? "SURVIVED!" : "FOX CAUGHT", 67, 90);
+            canvas.setTextSize(1);
+            canvas.drawCenterString("BOTH BTNS TO MENU", 67, 180);
+            drawBattery();
+        } 
+        else if (currentRole == ROLE_GAME_OVER) {
+            canvas.fillScreen(BLACK);
+            canvas.setTextColor(RED);
+            canvas.setTextSize(2);
+            canvas.drawCenterString("GAME OVER!", 67, 40);
+            canvas.setTextSize(4);
+            canvas.drawCenterString("X_X", 67, 90);
+            canvas.setTextSize(1);
+            canvas.setTextColor(WHITE);
+            canvas.drawCenterString("BOTH BTNS TO MENU", 67, 180);
+            drawBattery();
+        }
+
+        M5.Display.startWrite();
+        canvas.pushSprite(0, 0);
+        M5.Display.endWrite();
+    }
+}
